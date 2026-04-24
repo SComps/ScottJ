@@ -65,9 +65,22 @@ Namespace ScottJ
         Public Property ReadTimeout As Integer = 30000
         Public Property Encoding As Encoding = Encoding.UTF8
 
+        ''' <summary>If True, automatically attempts to reconnect if the connection drops unexpectedly.</summary>
+        Public Property AutoReconnect As Boolean = False
+
+        ''' <summary>Milliseconds to wait before attempting to reconnect. Default is 5000.</summary>
+        Public Property ReconnectDelay As Integer = 5000
+
+        ''' <summary>If True, enables TCP Keep-Alive to prevent idle connections from being dropped.</summary>
+        Public Property KeepAlive As Boolean = False
+
+        ''' <summary>Maximum size of the receive queue buffer. 0 = Unbounded.</summary>
+        Public Property MaxReceiveBufferSize As Integer = 0
+
         ' Events
         Public Event Connected(sender As Object, e As EventArgs)
         Public Event Disconnected(sender As Object, e As EventArgs)
+        Public Event Reconnecting(sender As Object, e As EventArgs)
         Public Event [Error](sender As Object, ex As Exception)
         Public Event DataReceived(sender As Object, data As Byte())
 
@@ -97,13 +110,25 @@ Namespace ScottJ
                 _cancellationSource = New CancellationTokenSource()
 
                 ' Reset the channel for a fresh connection (E1)
-                _incomingChannel =
-                    Channel.CreateUnbounded(Of Byte)(
+                If MaxReceiveBufferSize > 0 Then
+                    _incomingChannel = Channel.CreateBounded(Of Byte)(
+                        New BoundedChannelOptions(MaxReceiveBufferSize) With {
+                            .SingleReader = True,
+                            .SingleWriter = True,
+                            .FullMode = BoundedChannelFullMode.Wait
+                        })
+                Else
+                    _incomingChannel = Channel.CreateUnbounded(Of Byte)(
                         New UnboundedChannelOptions() With {.SingleReader = True, .SingleWriter = True})
+                End If
 
                 ' Dual-stack socket: supports both IPv4 and IPv6 (RS2)
                 _socket = New Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp)
                 _socket.DualMode = True
+
+                If KeepAlive Then
+                    _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, True)
+                End If
 
                 ' Connection timeout
                 Using ctsTimeout As New CancellationTokenSource(ConnectionTimeout)
@@ -138,7 +163,7 @@ Namespace ScottJ
                     If bytesReceived > 0 Then
                         ' Write bytes to the channel (E1)
                         For i As Integer = 0 To bytesReceived - 1
-                            _incomingChannel.Writer.TryWrite(_receiveBuffer(i))
+                            Await _incomingChannel.Writer.WriteAsync(_receiveBuffer(i), token)
                         Next
 
                         ' Raise DataReceived with a copy
@@ -161,9 +186,30 @@ Namespace ScottJ
             ' Unblock any waiting readers before cleaning up (R1)
             _incomingChannel.Writer.TryComplete()
 
+            Dim shouldReconnect As Boolean = False
             ' Disconnect only if not already being disposed (R1)
             If Not Volatile.Read(_disposed) Then
-                Await DisconnectInternal()
+                If AutoReconnect AndAlso Not token.IsCancellationRequested Then
+                    shouldReconnect = True
+                End If
+                Await DisconnectInternal(suppressEvents:=shouldReconnect)
+            End If
+
+            If shouldReconnect Then
+#Disable Warning BC42358
+                Task.Run(Async Function()
+                             While Not Volatile.Read(_disposed)
+                                 RaiseEvent Reconnecting(Me, EventArgs.Empty)
+                                 Try
+                                     Await Task.Delay(ReconnectDelay)
+                                     Await Connect()
+                                     Exit While
+                                 Catch
+                                     ' Try again on next loop iteration
+                                 End Try
+                             End While
+                         End Function)
+#Enable Warning BC42358
             End If
         End Function
 
@@ -296,10 +342,19 @@ Namespace ScottJ
             Throw New InvalidOperationException("Connection closed.")
         End Function
 
-        Public Async Function Disconnect() As Task
+        Public Async Function TryReadLineAsync(Optional removeCRLF As Boolean = True) As Task(Of Tuple(Of Boolean, String))
+            Try
+                Dim result = Await ReadLine(removeCRLF)
+                Return Tuple.Create(True, result)
+            Catch ex As TimeoutException
+                Return Tuple.Create(False, String.Empty)
+            End Try
+        End Function
+
+        Public Async Function Disconnect(Optional force As Boolean = False) As Task
             Await _syncLock.WaitAsync()
             Try
-                Await DisconnectInternal()
+                Await DisconnectInternal(force:=force)
             Finally
                 _syncLock.Release()
             End Try
@@ -309,7 +364,7 @@ Namespace ScottJ
         ''' Core disconnect logic. Thread-safe via Interlocked.Exchange on the socket reference (R1).
         ''' </summary>
         ''' <param name="suppressEvents">True when called from Dispose to avoid raising events on a torn-down object (R6).</param>
-        Private Function DisconnectInternal(Optional suppressEvents As Boolean = False) As Task
+        Private Function DisconnectInternal(Optional suppressEvents As Boolean = False, Optional force As Boolean = False) As Task
             Try
                 If _cancellationSource IsNot Nothing AndAlso Not _cancellationSource.IsCancellationRequested Then
                     _cancellationSource.Cancel()
@@ -319,6 +374,9 @@ Namespace ScottJ
                 Dim sock As Socket = Interlocked.Exchange(_socket, Nothing)
                 If sock IsNot Nothing Then
                     Try
+                        If force Then
+                            sock.LingerState = New LingerOption(True, 0)
+                        End If
                         If sock.Connected Then sock.Shutdown(SocketShutdown.Both)
                     Catch
                         ' Shutdown may fail if peer already closed

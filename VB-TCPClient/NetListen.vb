@@ -63,9 +63,7 @@ Namespace ScottJ
         Private _socket As Socket
         Private _cancellationSource As CancellationTokenSource
         Private _receiveBuffer(8191) As Byte
-        Private _incomingChannel As Channel(Of Byte) =
-            Channel.CreateUnbounded(Of Byte)(
-                New UnboundedChannelOptions() With {.SingleReader = True, .SingleWriter = True})
+        Private _incomingChannel As Channel(Of Byte)
         Private _disposed As Boolean = False
 
         ' --- Connection identity (read-only after construction) ---
@@ -107,7 +105,7 @@ Namespace ScottJ
 
         ' --- Internal construction (called by NetListen only) ---
 
-        Friend Sub New(acceptedSocket As Socket)
+        Friend Sub New(acceptedSocket As Socket, maxReceiveBufferSize As Integer)
             _socket = acceptedSocket
             Dim remoteEp = CType(_socket.RemoteEndPoint, IPEndPoint)
             RemoteEndPoint = remoteEp
@@ -118,6 +116,18 @@ Namespace ScottJ
             LocalEndPoint = localEp
             LocalAddress = localEp.Address.ToString()
             LocalPort = localEp.Port
+
+            If maxReceiveBufferSize > 0 Then
+                _incomingChannel = Channel.CreateBounded(Of Byte)(
+                    New BoundedChannelOptions(maxReceiveBufferSize) With {
+                        .SingleReader = True,
+                        .SingleWriter = True,
+                        .FullMode = BoundedChannelFullMode.Wait
+                    })
+            Else
+                _incomingChannel = Channel.CreateUnbounded(Of Byte)(
+                    New UnboundedChannelOptions() With {.SingleReader = True, .SingleWriter = True})
+            End If
         End Sub
 
         ''' <summary>Starts the background receive loop. Called by NetListen after acceptance.</summary>
@@ -137,7 +147,7 @@ Namespace ScottJ
 
                     If bytesReceived > 0 Then
                         For i As Integer = 0 To bytesReceived - 1
-                            _incomingChannel.Writer.TryWrite(_receiveBuffer(i))
+                            Await _incomingChannel.Writer.WriteAsync(_receiveBuffer(i), token)
                         Next
                         Dim data(bytesReceived - 1) As Byte
                         Array.Copy(_receiveBuffer, data, bytesReceived)
@@ -269,13 +279,22 @@ Namespace ScottJ
             Throw New InvalidOperationException("Session closed.")   ' Compiler flow
         End Function
 
-        ' --- Disconnect ---
-
-        Public Async Function Disconnect() As Task
-            Await DisconnectInternal()
+        Public Async Function TryReadLineAsync(Optional removeCRLF As Boolean = True) As Task(Of Tuple(Of Boolean, String))
+            Try
+                Dim result = Await ReadLine(removeCRLF)
+                Return Tuple.Create(True, result)
+            Catch ex As TimeoutException
+                Return Tuple.Create(False, String.Empty)
+            End Try
         End Function
 
-        Private Function DisconnectInternal(Optional suppressEvents As Boolean = False) As Task
+        ' --- Disconnect ---
+
+        Public Async Function Disconnect(Optional force As Boolean = False) As Task
+            Await DisconnectInternal(force:=force)
+        End Function
+
+        Private Function DisconnectInternal(Optional suppressEvents As Boolean = False, Optional force As Boolean = False) As Task
             Try
                 If _cancellationSource IsNot Nothing AndAlso
                    Not _cancellationSource.IsCancellationRequested Then
@@ -284,6 +303,9 @@ Namespace ScottJ
                 Dim sock As Socket = Interlocked.Exchange(_socket, Nothing)
                 If sock IsNot Nothing Then
                     Try
+                        If force Then
+                            sock.LingerState = New LingerOption(True, 0)
+                        End If
                         If sock.Connected Then sock.Shutdown(SocketShutdown.Both)
                     Catch
                     Finally
@@ -370,6 +392,12 @@ Namespace ScottJ
 
         ''' <summary>Maximum pending connections in the accept queue. Default 10.</summary>
         Public Property Backlog As Integer = 10
+
+        ''' <summary>If True, enables TCP Keep-Alive on accepted connections.</summary>
+        Public Property KeepAlive As Boolean = False
+
+        ''' <summary>Maximum size of the receive queue buffer for accepted sessions. 0 = Unbounded.</summary>
+        Public Property MaxReceiveBufferSize As Integer = 0
 
         ''' <summary>Thread-safe dictionary of all active sessions, keyed by their unique Guid.</summary>
         Public ReadOnly Property Sessions As New ConcurrentDictionary(Of Guid, NetSession)()
@@ -485,8 +513,8 @@ Namespace ScottJ
         End Function
 
         ''' <summary>Stops the listener gracefully.</summary>
-        Public Async Function [Stop]() As Task
-            Await StopInternal(suppressEvents:=False)
+        Public Async Function [Stop](Optional force As Boolean = False) As Task
+            Await StopInternal(suppressEvents:=False, force:=force)
         End Function
 
         ' --- Accept Loop ---
@@ -544,8 +572,13 @@ Namespace ScottJ
                     Return
                 End If
 
+                ' Apply Keep-Alive to accepted socket if enabled
+                If KeepAlive Then
+                    accepted.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, True)
+                End If
+
                 ' Accepted — create session and start its receive loop
-                Dim session As New NetSession(accepted)
+                Dim session As New NetSession(accepted, MaxReceiveBufferSize)
                 
                 ' Add to session manager
                 Sessions.TryAdd(session.Id, session)
@@ -571,7 +604,7 @@ Namespace ScottJ
 
         ' --- Internal Stop ---
 
-        Private Async Function StopInternal(Optional suppressEvents As Boolean = False) As Task
+        Private Async Function StopInternal(Optional suppressEvents As Boolean = False, Optional force As Boolean = False) As Task
             Try
                 If _cancellationSource IsNot Nothing AndAlso
                    Not _cancellationSource.IsCancellationRequested Then
@@ -589,7 +622,7 @@ Namespace ScottJ
                 ' Disconnect all active sessions
                 Dim activeSessions = Sessions.Values.ToList()
                 If activeSessions.Count > 0 Then
-                    Dim disconnectTasks = activeSessions.Select(Function(s) s.Disconnect())
+                    Dim disconnectTasks = activeSessions.Select(Function(s) s.Disconnect(force))
                     Await Task.WhenAll(disconnectTasks)
                 End If
             Catch ex As Exception
