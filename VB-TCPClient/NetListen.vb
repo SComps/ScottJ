@@ -1,4 +1,5 @@
 Imports System
+Imports System.Collections.Concurrent
 Imports System.Net
 Imports System.Net.Sockets
 Imports System.Text
@@ -25,16 +26,28 @@ Namespace ScottJ
         ''' <summary>Full remote endpoint of the connecting client.</summary>
         Public ReadOnly Property RemoteEndPoint As IPEndPoint
 
+        ''' <summary>IP address of the local interface the client connected to.</summary>
+        Public ReadOnly Property LocalAddress As String
+
+        ''' <summary>Local port the client connected to.</summary>
+        Public ReadOnly Property LocalPort As Integer
+
+        ''' <summary>Full local endpoint the client connected to.</summary>
+        Public ReadOnly Property LocalEndPoint As IPEndPoint
+
         ''' <summary>
         ''' Set to False in the ConnectionRequest handler to reject this connection.
         ''' Defaults to True — all connections are accepted unless explicitly rejected.
         ''' </summary>
         Public Property Accept As Boolean = True
 
-        Friend Sub New(ep As IPEndPoint)
-            RemoteEndPoint = ep
-            RemoteAddress = ep.Address.ToString()
-            RemotePort = ep.Port
+        Friend Sub New(remoteEp As IPEndPoint, localEp As IPEndPoint)
+            RemoteEndPoint = remoteEp
+            RemoteAddress = remoteEp.Address.ToString()
+            RemotePort = remoteEp.Port
+            LocalEndPoint = localEp
+            LocalAddress = localEp.Address.ToString()
+            LocalPort = localEp.Port
         End Sub
     End Class
 
@@ -57,6 +70,9 @@ Namespace ScottJ
 
         ' --- Connection identity (read-only after construction) ---
 
+        ''' <summary>Unique identifier for this session.</summary>
+        Public ReadOnly Property Id As Guid = Guid.NewGuid()
+
         ''' <summary>Remote client IP address string.</summary>
         Public ReadOnly Property RemoteAddress As String
 
@@ -65,6 +81,15 @@ Namespace ScottJ
 
         ''' <summary>Full remote endpoint.</summary>
         Public ReadOnly Property RemoteEndPoint As IPEndPoint
+
+        ''' <summary>Local IP address string.</summary>
+        Public ReadOnly Property LocalAddress As String
+
+        ''' <summary>Local port.</summary>
+        Public ReadOnly Property LocalPort As Integer
+
+        ''' <summary>Full local endpoint.</summary>
+        Public ReadOnly Property LocalEndPoint As IPEndPoint
 
         ' --- Configurable (consistent with NetClient) ---
 
@@ -84,10 +109,15 @@ Namespace ScottJ
 
         Friend Sub New(acceptedSocket As Socket)
             _socket = acceptedSocket
-            Dim ep = CType(_socket.RemoteEndPoint, IPEndPoint)
-            RemoteEndPoint = ep
-            RemoteAddress = ep.Address.ToString()
-            RemotePort = ep.Port
+            Dim remoteEp = CType(_socket.RemoteEndPoint, IPEndPoint)
+            RemoteEndPoint = remoteEp
+            RemoteAddress = remoteEp.Address.ToString()
+            RemotePort = remoteEp.Port
+
+            Dim localEp = CType(_socket.LocalEndPoint, IPEndPoint)
+            LocalEndPoint = localEp
+            LocalAddress = localEp.Address.ToString()
+            LocalPort = localEp.Port
         End Sub
 
         ''' <summary>Starts the background receive loop. Called by NetListen after acceptance.</summary>
@@ -341,6 +371,9 @@ Namespace ScottJ
         ''' <summary>Maximum pending connections in the accept queue. Default 10.</summary>
         Public Property Backlog As Integer = 10
 
+        ''' <summary>Thread-safe dictionary of all active sessions, keyed by their unique Guid.</summary>
+        Public ReadOnly Property Sessions As New ConcurrentDictionary(Of Guid, NetSession)()
+
         ' --- Events ---
 
         ''' <summary>
@@ -364,6 +397,26 @@ Namespace ScottJ
 
         ''' <summary>Raised on socket-level errors in the accept loop.</summary>
         Public Event [Error](sender As Object, ex As Exception)
+
+        ' --- Broadcast Methods ---
+
+        ''' <summary>Asynchronously broadcasts a line of text to all currently active sessions.</summary>
+        Public Async Function BroadcastLineAsync(data As String) As Task
+            Dim activeSessions = Sessions.Values.ToList()
+            If activeSessions.Count > 0 Then
+                Dim tasks = activeSessions.Select(Function(s) s.SendLine(data))
+                Await Task.WhenAll(tasks)
+            End If
+        End Function
+
+        ''' <summary>Asynchronously broadcasts raw bytes to all currently active sessions.</summary>
+        Public Async Function BroadcastAsync(data As Byte()) As Task
+            Dim activeSessions = Sessions.Values.ToList()
+            If activeSessions.Count > 0 Then
+                Dim tasks = activeSessions.Select(Function(s) s.SendAsync(data))
+                Await Task.WhenAll(tasks)
+            End If
+        End Function
 
         ' --- Constructors ---
 
@@ -473,8 +526,9 @@ Namespace ScottJ
 
         Private Sub HandleIncoming(accepted As Socket)
             Try
-                Dim ep = CType(accepted.RemoteEndPoint, IPEndPoint)
-                Dim args As New ConnectionRequestEventArgs(ep)
+                Dim remoteEp = CType(accepted.RemoteEndPoint, IPEndPoint)
+                Dim localEp = CType(accepted.LocalEndPoint, IPEndPoint)
+                Dim args As New ConnectionRequestEventArgs(remoteEp, localEp)
 
                 ' Raise ConnectionRequest — handler sets args.Accept = False to block
                 RaiseEvent ConnectionRequest(Me, args)
@@ -492,6 +546,16 @@ Namespace ScottJ
 
                 ' Accepted — create session and start its receive loop
                 Dim session As New NetSession(accepted)
+                
+                ' Add to session manager
+                Sessions.TryAdd(session.Id, session)
+                
+                ' Remove from session manager upon disconnection
+                AddHandler session.Disconnected, Sub(s, e)
+                                                     Dim removed As NetSession = Nothing
+                                                     Sessions.TryRemove(session.Id, removed)
+                                                 End Sub
+
                 session.StartReceiving()
                 RaiseEvent SessionConnected(Me, session)
 
@@ -507,7 +571,7 @@ Namespace ScottJ
 
         ' --- Internal Stop ---
 
-        Private Function StopInternal(Optional suppressEvents As Boolean = False) As Task
+        Private Async Function StopInternal(Optional suppressEvents As Boolean = False) As Task
             Try
                 If _cancellationSource IsNot Nothing AndAlso
                    Not _cancellationSource.IsCancellationRequested Then
@@ -521,10 +585,16 @@ Namespace ScottJ
                     Catch
                     End Try
                 End If
+
+                ' Disconnect all active sessions
+                Dim activeSessions = Sessions.Values.ToList()
+                If activeSessions.Count > 0 Then
+                    Dim disconnectTasks = activeSessions.Select(Function(s) s.Disconnect())
+                    Await Task.WhenAll(disconnectTasks)
+                End If
             Catch ex As Exception
                 If Not suppressEvents Then RaiseEvent [Error](Me, ex)
             End Try
-            Return Task.CompletedTask
         End Function
 
         ' --- IDisposable ---
