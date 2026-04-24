@@ -4,8 +4,10 @@ Imports System.Net
 Imports System.Net.Sockets
 Imports System.Text
 Imports System.Threading
+Imports System.Threading.Channels
 Imports System.IO
 Imports System.Linq
+Imports System.Security.Cryptography
 Imports System.Threading.Tasks
 
 Namespace ScottJ
@@ -14,22 +16,56 @@ Namespace ScottJ
 
         Private _socket As Socket
         Private _cancellationSource As CancellationTokenSource
+
+        ' 8 KB shared receive buffer — written only by ReceiveLoop
         Private _receiveBuffer(8191) As Byte
-        
-        ' Internal buffer for "Read" methods
-        Private _incomingQueue As New ConcurrentQueue(Of Byte)
-        Private _dataSignal As New SemaphoreSlim(0)
+
+        ' Channel(Of Byte) replaces ConcurrentQueue + SemaphoreSlim (E1, RS5)
+        ' SingleWriter = ReceiveLoop; SingleReader = ReadByte/ReadChar/ReadLine
+        Private _incomingChannel As Channel(Of Byte) =
+            Channel.CreateUnbounded(Of Byte)(
+                New UnboundedChannelOptions() With {.SingleReader = True, .SingleWriter = True})
+
         Private _syncLock As New SemaphoreSlim(1, 1)
-        
+
+        ' _disposed accessed only via Volatile.Read / Volatile.Write (R2)
         Private _disposed As Boolean = False
 
+        ' --- Backing fields for guarded properties (S1) ---
+        Private _host As String
+        Private _port As Integer
+
+        ''' <summary>Remote hostname or IP. Cannot be changed while connected.</summary>
         Public Property Host As String
+            Get
+                Return _host
+            End Get
+            Set(value As String)
+                If _socket IsNot Nothing AndAlso _socket.Connected Then
+                    Throw New InvalidOperationException("Cannot change Host while connected.")
+                End If
+                _host = value
+            End Set
+        End Property
+
+        ''' <summary>Remote TCP port (1–65535). Cannot be changed while connected.</summary>
         Public Property Port As Integer
+            Get
+                Return _port
+            End Get
+            Set(value As Integer)
+                If _socket IsNot Nothing AndAlso _socket.Connected Then
+                    Throw New InvalidOperationException("Cannot change Port while connected.")
+                End If
+                _port = value
+            End Set
+        End Property
+
         Public Property ConnectionTimeout As Integer = 10000
         Public Property ReadTimeout As Integer = 30000
         Public Property Encoding As Encoding = Encoding.UTF8
 
-        ' Events requested by the user
+        ' Events
         Public Event Connected(sender As Object, e As EventArgs)
         Public Event Disconnected(sender As Object, e As EventArgs)
         Public Event [Error](sender As Object, ex As Exception)
@@ -45,35 +81,31 @@ Namespace ScottJ
         End Sub
 
         Public Async Function Connect() As Task
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
 
             Await _syncLock.WaitAsync()
             Try
-                ' Validate Host and Port
+                ' Validate Host and Port (RS4)
                 If String.IsNullOrEmpty(Host) Then Throw New InvalidOperationException("Host must be specified.")
-                If Port <= 0 Then Throw New InvalidOperationException("Valid Port must be specified.")
+                If Port < 1 OrElse Port > 65535 Then Throw New InvalidOperationException("Port must be between 1 and 65535.")
 
-                ' If already connected, disconnect first to ensure clean state
+                ' If already connected, disconnect first
                 If _socket IsNot Nothing AndAlso _socket.Connected Then
                     Await DisconnectInternal()
                 End If
 
-                ' Reset state for a fresh connection
                 _cancellationSource = New CancellationTokenSource()
-                
-                ' Clear the queue
-                While _incomingQueue.Count > 0
-                    Dim b As Byte
-                    _incomingQueue.TryDequeue(b)
-                End While
 
-                ' Reset the semaphore signal
-                _dataSignal.Dispose()
-                _dataSignal = New SemaphoreSlim(0)
+                ' Reset the channel for a fresh connection (E1)
+                _incomingChannel =
+                    Channel.CreateUnbounded(Of Byte)(
+                        New UnboundedChannelOptions() With {.SingleReader = True, .SingleWriter = True})
 
-                _socket = New Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+                ' Dual-stack socket: supports both IPv4 and IPv6 (RS2)
+                _socket = New Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp)
+                _socket.DualMode = True
 
-                ' Implement connection timeout
+                ' Connection timeout
                 Using ctsTimeout As New CancellationTokenSource(ConnectionTimeout)
                     Try
                         Await _socket.ConnectAsync(Host, Port, ctsTimeout.Token)
@@ -81,10 +113,10 @@ Namespace ScottJ
                         Throw New TimeoutException($"Connection to {Host}:{Port} timed out after {ConnectionTimeout}ms.")
                     End Try
                 End Using
-                
+
                 RaiseEvent Connected(Me, EventArgs.Empty)
 
-                ' Start receiving data in the background
+                ' Start receive loop in the background
                 Dim receiveTask = Task.Run(Function() ReceiveLoop(), _cancellationSource.Token)
 
             Catch ex As Exception
@@ -96,18 +128,20 @@ Namespace ScottJ
         End Function
 
         Private Async Function ReceiveLoop() As Task
+            ' Capture token once — avoids null-ref if _cancellationSource is replaced concurrently (R3)
+            Dim token = _cancellationSource.Token
             Try
-                While Not _cancellationSource.Token.IsCancellationRequested
-                    Dim bytesReceived As Integer = Await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, _cancellationSource.Token)
+                While Not token.IsCancellationRequested
+                    Dim bytesReceived As Integer =
+                        Await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, token)
 
                     If bytesReceived > 0 Then
-                        ' Efficiently queue the data
+                        ' Write bytes to the channel (E1)
                         For i As Integer = 0 To bytesReceived - 1
-                            _incomingQueue.Enqueue(_receiveBuffer(i))
+                            _incomingChannel.Writer.TryWrite(_receiveBuffer(i))
                         Next
-                        _dataSignal.Release(bytesReceived)
 
-                        ' Raise DataReceived event with a copy
+                        ' Raise DataReceived with a copy
                         Dim data(bytesReceived - 1) As Byte
                         Array.Copy(_receiveBuffer, data, bytesReceived)
                         RaiseEvent DataReceived(Me, data)
@@ -117,21 +151,28 @@ Namespace ScottJ
                     End If
                 End While
             Catch ex As OperationCanceledException
-                ' Normal shutdown
+                ' Normal shutdown — no action needed
             Catch ex As Exception
-                If Not _cancellationSource.IsCancellationRequested Then
+                If Not token.IsCancellationRequested Then
                     RaiseEvent [Error](Me, ex)
                 End If
             End Try
-            
-            ' Ensure cleanup happens
-            Dim cleanupTask = Disconnect()
+
+            ' Unblock any waiting readers before cleaning up (R1)
+            _incomingChannel.Writer.TryComplete()
+
+            ' Disconnect only if not already being disposed (R1)
+            If Not Volatile.Read(_disposed) Then
+                Await DisconnectInternal()
+            End If
         End Function
 
         ' --- Non-Blocking Send Methods ---
 
         Public Async Function SendByte(value As Byte) As Task
-            Await SendAsync({value})
+            Dim buf(0) As Byte
+            buf(0) = value
+            Await SendAsync(buf)
         End Function
 
         Public Async Function SendChar(value As Char) As Task
@@ -149,7 +190,7 @@ Namespace ScottJ
         End Function
 
         Public Async Function SendAsync(data As Byte()) As Task
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
 
             Try
                 If _socket IsNot Nothing AndAlso _socket.Connected Then
@@ -166,13 +207,19 @@ Namespace ScottJ
         ' --- Non-Blocking Read Methods ---
 
         Public Async Function ReadByte() As Task(Of Byte)
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
-            
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
+
             Try
                 Using ctsRead As New CancellationTokenSource(ReadTimeout)
                     Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ctsRead.Token, _cancellationSource.Token)
                         Try
-                            Await _dataSignal.WaitAsync(linkedCts.Token)
+                            ' WaitToReadAsync returns False when the channel is completed (connection closed)
+                            If Not Await _incomingChannel.Reader.WaitToReadAsync(linkedCts.Token) Then
+                                Throw New InvalidOperationException("Connection closed.")
+                            End If
+                            Dim b As Byte
+                            If _incomingChannel.Reader.TryRead(b) Then Return b
+                            Throw New InvalidOperationException("Failed to read byte.")
                         Catch ex As OperationCanceledException
                             If ctsRead.IsCancellationRequested Then
                                 Throw New TimeoutException($"Read operation timed out after {ReadTimeout}ms.")
@@ -180,12 +227,6 @@ Namespace ScottJ
                                 Throw New InvalidOperationException("Connection closed.")
                             End If
                         End Try
-                        
-                        Dim b As Byte
-                        If _incomingQueue.TryDequeue(b) Then
-                            Return b
-                        End If
-                        Throw New InvalidOperationException("Failed to read byte.")
                     End Using
                 End Using
             Catch ex As Exception
@@ -195,47 +236,46 @@ Namespace ScottJ
         End Function
 
         Public Async Function ReadChar() As Task(Of Char)
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
-            
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
+
             Try
                 Dim decoder = Encoding.GetDecoder()
                 Dim bytes(0) As Byte
                 Dim chars(0) As Char
-                
+
                 While True
-                    ' Note: ReadByte already raises Error event on failure
                     bytes(0) = Await ReadByte()
                     Dim completed As Boolean
                     Dim bytesUsed As Integer
                     Dim charsUsed As Integer
                     decoder.Convert(bytes, 0, 1, chars, 0, 1, False, bytesUsed, charsUsed, completed)
-                    if charsUsed > 0 Then
-                        Return chars(0)
-                    End If
+                    If charsUsed > 0 Then Return chars(0)
                 End While
             Catch ex As Exception
-                ' Only raise if it's not already reported by ReadByte (though most will be)
-                If Not (TypeOf ex Is TimeoutException Or TypeOf ex Is InvalidOperationException Or TypeOf ex Is SocketException) Then
+                If Not (TypeOf ex Is TimeoutException OrElse TypeOf ex Is InvalidOperationException OrElse TypeOf ex Is SocketException) Then
                     RaiseEvent [Error](Me, ex)
                 End If
                 Throw
             End Try
+
+            ' R7: unreachable — kept only to satisfy compiler flow analysis
             Throw New InvalidOperationException("Connection closed.")
         End Function
 
         Public Async Function ReadLine(Optional removeCRLF As Boolean = True) As Task(Of String)
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
 
             Try
                 Dim sb As New StringBuilder()
                 Dim lastByte As Byte = 0
-                
+                Dim rawByte(0) As Byte   ' Pre-allocated to avoid per-byte heap allocation (E3)
+
                 While True
-                    ' Note: ReadByte already raises Error event on failure
                     Dim b = Await ReadByte()
-                    sb.Append(Encoding.GetChars({b}))
-                    
-                    If lastByte = 13 AndAlso b = 10 Then ' CR (13) and LF (10)
+                    rawByte(0) = b
+                    sb.Append(Encoding.GetChars(rawByte))
+
+                    If lastByte = 13 AndAlso b = 10 Then   ' CRLF
                         Dim result = sb.ToString()
                         If removeCRLF Then
                             Return result.Substring(0, result.Length - 2)
@@ -246,12 +286,13 @@ Namespace ScottJ
                     lastByte = b
                 End While
             Catch ex As Exception
-                ' Only raise if it's not already reported by ReadByte
-                If Not (TypeOf ex Is TimeoutException Or TypeOf ex Is InvalidOperationException Or TypeOf ex Is SocketException) Then
+                If Not (TypeOf ex Is TimeoutException OrElse TypeOf ex Is InvalidOperationException OrElse TypeOf ex Is SocketException) Then
                     RaiseEvent [Error](Me, ex)
                 End If
                 Throw
             End Try
+
+            ' R7: unreachable — kept only to satisfy compiler flow analysis
             Throw New InvalidOperationException("Connection closed.")
         End Function
 
@@ -264,29 +305,36 @@ Namespace ScottJ
             End Try
         End Function
 
-        Private Function DisconnectInternal() As Task
+        ''' <summary>
+        ''' Core disconnect logic. Thread-safe via Interlocked.Exchange on the socket reference (R1).
+        ''' </summary>
+        ''' <param name="suppressEvents">True when called from Dispose to avoid raising events on a torn-down object (R6).</param>
+        Private Function DisconnectInternal(Optional suppressEvents As Boolean = False) As Task
             Try
                 If _cancellationSource IsNot Nothing AndAlso Not _cancellationSource.IsCancellationRequested Then
                     _cancellationSource.Cancel()
                 End If
-                
-                If _socket IsNot Nothing Then
+
+                ' Atomically take ownership of the socket — prevents double-close races (R1)
+                Dim sock As Socket = Interlocked.Exchange(_socket, Nothing)
+                If sock IsNot Nothing Then
                     Try
-                        If _socket.Connected Then
-                            _socket.Shutdown(SocketShutdown.Both)
-                        End If
+                        If sock.Connected Then sock.Shutdown(SocketShutdown.Both)
                     Catch
-                        ' Shutdown might fail if already closed by peer
+                        ' Shutdown may fail if peer already closed
                     Finally
-                        _socket.Close()
-                        _socket.Dispose()
-                        _socket = Nothing
+                        sock.Close()
+                        sock.Dispose()
                     End Try
-                    RaiseEvent Disconnected(Me, EventArgs.Empty)
+                    If Not suppressEvents Then
+                        RaiseEvent Disconnected(Me, EventArgs.Empty)
+                    End If
                 End If
 
             Catch ex As Exception
-                RaiseEvent [Error](Me, ex)
+                If Not suppressEvents Then
+                    RaiseEvent [Error](Me, ex)
+                End If
             End Try
             Return Task.CompletedTask
         End Function
@@ -299,17 +347,15 @@ Namespace ScottJ
         End Sub
 
         Protected Overridable Sub Dispose(disposing As Boolean)
-            If Not _disposed Then
+            If Not Volatile.Read(_disposed) Then
                 If disposing Then
-                    ' Free managed resources
-                    DisconnectInternal().GetAwaiter().GetResult()
+                    ' Suppress events during disposal (R6); complete channel before socket teardown (R1)
+                    _incomingChannel.Writer.TryComplete()
+                    DisconnectInternal(suppressEvents:=True).GetAwaiter().GetResult()
                     _syncLock?.Dispose()
-                    _dataSignal?.Dispose()
                     _cancellationSource?.Dispose()
                 End If
-                
-                ' Free unmanaged resources if any
-                _disposed = True
+                Volatile.Write(_disposed, True)   ' R2: ensure visibility across threads
             End If
         End Sub
 
@@ -322,18 +368,20 @@ Namespace ScottJ
         ''' <summary>
         ''' Resolves Me.Host to its IPv4 and IPv6 addresses as a comma-separated string.
         ''' </summary>
-        ''' <param name="nameServer">Optional DNS server (IPv4, IPv6, or FQDN) to query. Uses system default if empty.</param>
+        ''' <param name="nameServer">Optional DNS server (IPv4, IPv6, or FQDN). Uses system default if empty.</param>
         Public Async Function GetHostByName(Optional nameServer As String = Nothing) As Task(Of String)
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
             If String.IsNullOrEmpty(Host) Then Throw New InvalidOperationException("Host must be specified.")
             Try
                 If String.IsNullOrEmpty(nameServer) Then
                     Dim addresses = Await Dns.GetHostAddressesAsync(Host)
                     Return String.Join(", ", addresses.Select(Function(a) a.ToString()))
                 Else
-                    Dim v4 = Await QueryDnsServer(Host, nameServer, DnsRType.A)
-                    Dim v6 = Await QueryDnsServer(Host, nameServer, DnsRType.AAAA)
-                    Dim all = v4.Concat(v6).ToList()
+                    ' Fire A and AAAA queries in parallel (E2)
+                    Dim v4Task = QueryDnsServer(Host, nameServer, DnsRType.A)
+                    Dim v6Task = QueryDnsServer(Host, nameServer, DnsRType.AAAA)
+                    Await Task.WhenAll(v4Task, v6Task)
+                    Dim all = v4Task.Result.Concat(v6Task.Result).ToList()
                     Return If(all.Count > 0, String.Join(", ", all), String.Empty)
                 End If
             Catch ex As Exception
@@ -343,11 +391,11 @@ Namespace ScottJ
         End Function
 
         ''' <summary>
-        ''' Performs a reverse DNS lookup on Me.Host, returning the canonical hostname as a string.
+        ''' Performs a reverse DNS lookup on Me.Host, returning the canonical hostname.
         ''' </summary>
-        ''' <param name="nameServer">Optional DNS server (IPv4, IPv6, or FQDN) to query. Uses system default if empty.</param>
+        ''' <param name="nameServer">Optional DNS server (IPv4, IPv6, or FQDN). Uses system default if empty.</param>
         Public Async Function GetNameByHost(Optional nameServer As String = Nothing) As Task(Of String)
-            If _disposed Then Throw New ObjectDisposedException(Me.GetType().Name)
+            If Volatile.Read(_disposed) Then Throw New ObjectDisposedException(Me.GetType().Name)
             If String.IsNullOrEmpty(Host) Then Throw New InvalidOperationException("Host must be specified.")
             Try
                 If String.IsNullOrEmpty(nameServer) Then
@@ -372,7 +420,7 @@ Namespace ScottJ
             AAAA = 28
         End Enum
 
-        ''' <summary>Converts an IP string to its in-addr.arpa / ip6.arpa PTR form.</summary>
+        ''' <summary>Converts an IP string to its .in-addr.arpa / .ip6.arpa PTR form.</summary>
         Private Shared Function BuildPtrName(ipOrHost As String) As String
             Dim addr As IPAddress = Nothing
             If IPAddress.TryParse(ipOrHost, addr) Then
@@ -391,7 +439,9 @@ Namespace ScottJ
             Return ipOrHost
         End Function
 
-        ''' <summary>Sends a DNS UDP query to the specified nameserver and returns matching records.</summary>
+        ''' <summary>
+        ''' Sends a DNS UDP query to the specified nameserver, with retry (RS3) and txId verification (RS3).
+        ''' </summary>
         Private Shared Async Function QueryDnsServer(name As String, nameServer As String, recordType As DnsRType) As Task(Of List(Of String))
             Dim nsAddr As IPAddress = Nothing
             If Not IPAddress.TryParse(nameServer, nsAddr) Then
@@ -402,63 +452,88 @@ Namespace ScottJ
             If nsAddr Is Nothing Then Throw New InvalidOperationException($"Cannot resolve nameserver: {nameServer}")
 
             Dim ep As New IPEndPoint(nsAddr, 53)
-            Dim txId As UShort = CUShort(Environment.TickCount And &HFFFF)
+
+            ' Cryptographically random transaction ID (S2, E5)
+            Dim txId As UShort = CUShort(RandomNumberGenerator.GetInt32(0, 65536))
             Dim query = BuildDnsQuery(name, txId, recordType)
 
-            Using udp As New UdpClient()
-                udp.Client.ReceiveTimeout = 5000
-                Await udp.SendAsync(query, query.Length, ep)
-                Dim reply = Await udp.ReceiveAsync()
-                Return ParseDnsResponse(reply.Buffer, recordType)
-            End Using
+            ' Retry up to 3 attempts on timeout (RS3)
+            Const maxAttempts As Integer = 3
+            For attempt As Integer = 1 To maxAttempts
+                Using udp As New UdpClient()
+                    udp.Client.ReceiveTimeout = 3000
+                    Try
+                        Await udp.SendAsync(query, query.Length, ep)
+                        Dim reply = Await udp.ReceiveAsync()
+
+                        ' Verify reply transaction ID matches query (RS3)
+                        Dim replyId As UShort = CUShort((reply.Buffer(0) << 8) Or reply.Buffer(1))
+                        If replyId <> txId Then Continue For   ' stale/mismatched — retry
+
+                        Return ParseDnsResponse(reply.Buffer, recordType)
+                    Catch ex As SocketException When ex.SocketErrorCode = SocketError.TimedOut
+                        If attempt = maxAttempts Then Throw
+                        ' else retry
+                    End Try
+                End Using
+            Next
+
+            Return New List(Of String)()
         End Function
 
-        ''' <summary>Builds a minimal DNS query packet.</summary>
+        ''' <summary>Builds a minimal RFC 1035 DNS query packet.</summary>
         Private Shared Function BuildDnsQuery(name As String, txId As UShort, recordType As DnsRType) As Byte()
-            Using ms As New MemoryStream()
+            Using ms As New MemoryStream(64)   ' Pre-sized: typical query is 30–50 bytes (E6)
                 ' Header
                 ms.WriteByte(CByte(txId >> 8)) : ms.WriteByte(CByte(txId And &HFF))
-                ms.WriteByte(&H1) : ms.WriteByte(&H0)   ' Flags: RD set
+                ms.WriteByte(&H1) : ms.WriteByte(&H0)    ' Flags: RD set
                 ms.WriteByte(0) : ms.WriteByte(1)        ' QDCOUNT = 1
                 ms.WriteByte(0) : ms.WriteByte(0)        ' ANCOUNT = 0
                 ms.WriteByte(0) : ms.WriteByte(0)        ' NSCOUNT = 0
                 ms.WriteByte(0) : ms.WriteByte(0)        ' ARCOUNT = 0
-                ' Question: encoded FQDN
+                ' Encoded FQDN
                 For Each label In name.Split("."c)
                     Dim lb = Encoding.ASCII.GetBytes(label)
                     ms.WriteByte(CByte(lb.Length))
                     ms.Write(lb, 0, lb.Length)
                 Next
-                ms.WriteByte(0)  ' root label
+                ms.WriteByte(0)   ' root label
                 Dim rt = CUShort(recordType)
-                ms.WriteByte(CByte(rt >> 8)) : ms.WriteByte(CByte(rt And &HFF))  ' QTYPE
-                ms.WriteByte(0) : ms.WriteByte(1)                                 ' QCLASS = IN
+                ms.WriteByte(CByte(rt >> 8)) : ms.WriteByte(CByte(rt And &HFF))   ' QTYPE
+                ms.WriteByte(0) : ms.WriteByte(1)                                  ' QCLASS = IN
                 Return ms.ToArray()
             End Using
         End Function
 
-        ''' <summary>Parses a DNS response packet and extracts records matching recordType.</summary>
+        ''' <summary>Parses a DNS response packet and returns records matching recordType.</summary>
         Private Shared Function ParseDnsResponse(data As Byte(), recordType As DnsRType) As List(Of String)
             Dim results As New List(Of String)()
             If data.Length < 12 Then Return results
-            Dim anCount As Integer = (data(6) << 8) Or data(7)
+
+            ' Cap anCount to a sane limit to prevent DoS from crafted packets (S4)
+            Dim anCount As Integer = Math.Min((data(6) << 8) Or data(7), 100)
             If anCount = 0 Then Return results
 
             Dim pos As Integer = 12
-            pos = DnsSkipName(data, pos) : pos += 4  ' skip QNAME + QTYPE + QCLASS
+            pos = DnsSkipName(data, pos) : pos += 4   ' skip QNAME + QTYPE + QCLASS
 
             For i As Integer = 0 To anCount - 1
                 If pos >= data.Length Then Exit For
                 pos = DnsSkipName(data, pos)
                 If pos + 10 > data.Length Then Exit For
+
                 Dim rtype As UShort = CUShort((data(pos) << 8) Or data(pos + 1))
-                pos += 8  ' skip type(2) + class(2) + TTL(4)
+                pos += 8   ' skip type(2) + class(2) + TTL(4)
                 Dim rdLen As Integer = (data(pos) << 8) Or data(pos + 1)
                 pos += 2
+
+                ' Bounds-check rdLen before trusting it (R4, S4)
+                If rdLen < 0 OrElse pos + rdLen > data.Length Then Exit For
+
                 If rtype = CUShort(recordType) Then
                     Select Case recordType
                         Case DnsRType.A
-                            If rdLen = 4 Then results.Add($"{data(pos)}.{data(pos+1)}.{data(pos+2)}.{data(pos+3)}")
+                            If rdLen = 4 Then results.Add($"{data(pos)}.{data(pos + 1)}.{data(pos + 2)}.{data(pos + 3)}")
                         Case DnsRType.AAAA
                             If rdLen = 16 Then
                                 Dim b(15) As Byte : Array.Copy(data, pos, b, 0, 16)
@@ -473,27 +548,35 @@ Namespace ScottJ
             Return results
         End Function
 
-        ''' <summary>Advances past a DNS name (handles compression pointers).</summary>
+        ''' <summary>Advances past a DNS name field (handles compression pointers).</summary>
         Private Shared Function DnsSkipName(data As Byte(), pos As Integer) As Integer
             While pos < data.Length
                 Dim len As Byte = data(pos)
                 If len = 0 Then Return pos + 1
-                If (len And &HC0) = &HC0 Then Return pos + 2
+                If (len And &HC0) = &HC0 Then Return pos + 2   ' compression pointer
                 pos += len + 1
             End While
             Return pos
         End Function
 
-        ''' <summary>Reads a DNS name (following compression pointers).</summary>
-        Private Shared Function DnsReadName(data As Byte(), pos As Integer) As String
+        ''' <summary>
+        ''' Reads a DNS name, following compression pointers.
+        ''' depth guard prevents infinite recursion on circular pointer chains (R5).
+        ''' </summary>
+        Private Shared Function DnsReadName(data As Byte(), pos As Integer, Optional depth As Integer = 0) As String
+            ' Limit recursion depth to guard against circular pointer chains (R5)
+            If depth > 10 OrElse pos >= data.Length Then Return String.Empty
+
             Dim sb As New StringBuilder()
             While pos < data.Length
                 Dim len As Byte = data(pos)
                 If len = 0 Then Exit While
                 If (len And &HC0) = &HC0 Then
+                    ' Compression pointer
+                    If pos + 1 >= data.Length Then Exit While
                     Dim ptr As Integer = ((len And &H3F) << 8) Or data(pos + 1)
                     If sb.Length > 0 Then sb.Append(".")
-                    sb.Append(DnsReadName(data, ptr))
+                    sb.Append(DnsReadName(data, ptr, depth + 1))
                     Exit While
                 End If
                 pos += 1
@@ -503,5 +586,6 @@ Namespace ScottJ
             End While
             Return sb.ToString()
         End Function
+
     End Class
 End Namespace
